@@ -8,333 +8,273 @@ vim9script
 # License:      Same as Vim itself (see :h license)
 # ==============================================================================
 
-var is_running: bool = false        # true if jqplay session running, false otherwise
-var in_buf: number = -1             # input buffer number (optional)
-var in_changedtick: number = -1     # b:changedtick of input buffer (optional)
-var in_timer: number = 0            # timer-ID of input buffer (optional)
-var filter_buf: number = 0          # filter buffer number
-var filter_changedtick: number = 0  # b:changedtick of filter buffer
-var filter_timer: number = 0        # timer-ID of filter buffer
-var filter_file: string = ''        # full path to filter file on disk
-var out_buf: number = 0             # output buffer number
-var jq_cmd: string = ''             # jq command running on buffer change
-var job_id: job                     # job object of jq process
+let s:save_cpo = &cpoptions
+set cpoptions&vim
 
-const defaults: dict<any> = {
-    exe: exepath('jq'),
-    opts: '',
-    delay: 500,
-    autocmds: ['InsertLeave', 'TextChanged']
-}
+" Flag that indicates whether a jqplay session is running
+let s:jqplay_open = 0
 
-def Getopt(key: string): any
-    return get(g:, 'jqplay', {})->get(key, defaults[key])
-enddef
+let s:defaults = {
+        \ 'exe': exepath('jq'),
+        \ 'opts': '',
+        \ 'autocmds': ['InsertLeave', 'TextChanged']
+        \ }
 
-# Helper function to create full jq command
-def Jqcmd(exe: string, opts: string, args: string, file: string): string
-    return $'{exe} {opts} {args} -f {file}'
-enddef
+function! s:get(key) abort
+    let jqplay = get(b:, 'jqplay', get(g:, 'jqplay', {}))
+    return has_key(jqplay, a:key) ? get(jqplay, a:key) : get(s:defaults, a:key)
+endfunction
 
-# Is jqplay session running with input buffer?
-def Jq_with_input(): bool
-    return in_buf != -1
-enddef
+function! s:error(msg) abort
+    echohl ErrorMsg | echomsg a:msg | echohl None
+    return 0
+endfunction
 
-def Error(msg: string)
-    echohl ErrorMsg | echomsg '[jqplay]' msg | echohl None
-enddef
+function! s:new_scratch(bufname, filetype, clean, mods, ...) abort
+    let winid = win_getid()
 
-def Warning(msg: string)
-    echohl WarningMsg | echomsg '[jqplay]' msg | echohl None
-enddef
-
-def New_scratch(bufname: string, filetype: string, clean: bool, mods: string, opts: dict<any> = {}): number
-    const winid: number = win_getid()
-    var bufnr: number
-
-    if bufexists(bufname)
-        bufnr = bufnr(bufname)
-        setbufvar(bufnr, '&filetype', filetype)
-        if clean
-            silent deletebufline(bufnr, 1, '$')
+    if bufexists(a:bufname)
+        let bufnr = bufnr(a:bufname)
+        call setbufvar(bufnr, '&filetype', a:filetype)
+        if a:clean
+            silent call deletebufline(bufnr, 1, '$')
         endif
 
         if bufwinnr(bufnr) > 0
             return bufnr
         else
-            silent execute mods 'sbuffer' bufnr
+            silent execute a:mods 'keepalt sbuffer' bufnr
         endif
     else
-        noautocmd silent execute mods 'new' fnameescape(bufname)
+        silent execute a:mods 'keepalt new' fnameescape(a:bufname)
         setlocal noswapfile buflisted buftype=nofile bufhidden=hide
-        bufnr = bufnr()
-        setbufvar(bufnr, '&filetype', filetype)
+        let bufnr = bufnr('%')
+        call setbufvar(bufnr, '&filetype', a:filetype)
     endif
 
-    if has_key(opts, 'resize')
-        execute 'resize' opts.resize
+    if a:0
+        execute 'resize' a:1
     endif
-
-    win_gotoid(winid)
-
+    call win_gotoid(winid)
     return bufnr
-enddef
+endfunction
 
-def Run_manually(bang: bool, args: string)
-    if args =~ '\%(^\|\s\)-\a*f\>\|--from-file\>'
-        Error('-f and --from-file options not allowed')
+function! s:jqcmd(exe, opts, args, file) abort
+    return printf('%s %s %s -f %s', a:exe, a:opts, a:args, a:file)
+endfunction
+
+function! jqplay#start(mods, args, in_buf) abort
+    if a:args =~# '-\a*f\>\|--from-file\>'
+        return s:error('jqplay: -f and --from-file options not allowed')
+    endif
+
+    if s:jqplay_open
+        return s:error('jqplay: only one session per Vim instance allowed')
+    endif
+
+    let raw_output = a:args =~# '-\a*r\a*\>\|--raw-output\>' ? 1 : 0
+    let join_output = a:args =~# '-\a*j\a*\>\|--join-output\>' ? 1 : 0
+    let out_ft = raw_output || join_output ? '' : 'json'
+    let out_name = 'jq-output://' . (a:in_buf == -1 ? '' : bufname(a:in_buf))
+    let out_buf = s:new_scratch(out_name, out_ft, 1, a:mods)
+    let filter_name = 'jq-filter://' . (a:in_buf == -1 ? '' : bufname(a:in_buf))
+    let filter_buf = s:new_scratch(filter_name, 'jq', 0, 'botright', 10)
+    let filter_file = tempname()
+    let jq_cmd = s:jqcmd(s:get('exe'), s:get('opts'), a:args, filter_file)
+
+    let s:jq_ctx = {
+            \ 'in_buf': a:in_buf,
+            \ 'out_buf': out_buf,
+            \ 'filter_buf': filter_buf,
+            \ 'filter_file': filter_file,
+            \ 'cmd': jq_cmd
+            \ }
+
+    if a:in_buf != -1
+        call setbufvar(a:in_buf, 'jq_changedtick', getbufvar(a:in_buf, 'changedtick'))
+    endif
+    call setbufvar(filter_buf, 'jq_changedtick', getbufvar(filter_buf, 'changedtick'))
+
+    augroup jqplay
+        autocmd!
+        if a:in_buf != -1
+            execute printf('autocmd BufDelete,BufWipeout <buffer=%d> call jqplay#close(0)', a:in_buf)
+        endif
+        execute printf('autocmd BufDelete,BufWipeout <buffer=%d> call jqplay#close(0)', out_buf)
+        execute printf('autocmd BufDelete,BufWipeout <buffer=%d> call jqplay#close(0)', filter_buf)
+    augroup END
+
+    if !empty(s:get('autocmds'))
+        let events = join(s:get('autocmds'), ',')
+        if a:in_buf != -1
+            execute printf('autocmd jqplay %s <buffer> call s:input_changed()', events)
+        endif
+        execute printf('autocmd jqplay %s <buffer=%d> call s:filter_changed()', events, filter_buf)
+    endif
+
+    execute 'command! -bar -bang JqplayClose call jqplay#close(<bang>0)'
+    execute 'command! -bar -bang -nargs=? -complete=customlist,jqplay#complete Jqrun call s:run_manually(<bang>0, <q-args>)'
+    execute 'command! -nargs=? -complete=custom,jqplay#stophow Jqstop call jqplay#stop(<f-args>)'
+    let s:jqplay_open = 1
+endfunction
+
+function! jqplay#scratch(bang, mods, args) abort
+    let raw_input = a:args =~# '-\a*R\a*\>\|--raw-input\>' ? 1 : 0
+    let null_input = a:args =~# '-\a*n\a*\>\|--null-input\>' ? 1 : 0
+
+    if a:bang && raw_input && null_input
+        return s:error('jqplay: not possible to run :JqplayScratch! with -n and -R')
+    endif
+
+    if !s:jqplay_open && !a:bang
+        tabnew
+        setlocal buflisted buftype=nofile bufhidden=hide noswapfile
+        call setbufvar('%', '&filetype', raw_input ? '' : 'json')
+    elseif !s:jqplay_open && a:bang
+        tab split
+    endif
+
+    let args = a:bang && !null_input ? (a:args . ' -n') : a:args
+    let bufnr = a:bang ? -1: bufnr('%')
+    call jqplay#start(a:mods, args, bufnr)
+    " need to close the window that we opened with :tab split
+    if a:bang
+        close
+    endif
+endfunction
+
+function! jqplay#ctx() abort
+    return s:jqplay_open ? s:jq_ctx : {}
+endfunction
+
+function! jqplay#close(bang) abort
+    if !s:jqplay_open && !(exists('#jqplay#BufDelete') || exists('#jqplay#BufWipeout'))
         return
     endif
+    call jqplay#stop()
+    autocmd! jqplay
 
-    if filter_changedtick != getbufvar(filter_buf, 'changedtick')
-        filter_buf->getbufline(1, '$')->writefile(filter_file)
-    endif
-
-    const cmd: string = Jqcmd(Getopt('exe'), Getopt('opts'), args, filter_file)
-    Run_jq(cmd)
-
-    if bang
-        jq_cmd = cmd
-    endif
-enddef
-
-def On_filter_changed()
-    if filter_changedtick == getbufvar(filter_buf, 'changedtick')
-        return
-    endif
-
-    filter_changedtick = getbufvar(filter_buf, 'changedtick')
-    timer_stop(filter_timer)
-    filter_timer = Getopt('delay')->timer_start(Filter_changed)
-enddef
-
-def Filter_changed(timer: number)
-    filter_buf->getbufline(1, '$')->writefile(filter_file)
-    Run_jq(jq_cmd)
-enddef
-
-def On_input_changed()
-    if in_changedtick == getbufvar(in_buf, 'changedtick')
-        return
-    endif
-
-    in_changedtick = getbufvar(in_buf, 'changedtick')
-    timer_stop(in_timer)
-    in_timer = Getopt('delay')->timer_start((_) => Run_jq(jq_cmd))
-enddef
-
-def Close_cb(ch: channel)
-    silent deletebufline(out_buf, 1)
-    redrawstatus!
-enddef
-
-def Run_jq(cmd: string)
-    silent deletebufline(out_buf, 1, '$')
-
-    if exists('job_id') && job_status(job_id) == 'run'
-        job_stop(job_id)
-    endif
-
-    final opts: dict<any> = {
-        in_io: 'null',
-        out_cb: (_, msg: string) => appendbufline(out_buf, '$', msg),
-        err_cb: (_, msg: string) => appendbufline(out_buf, '$', '// ' .. msg),
-        close_cb: Close_cb
-    }
-
-    if Jq_with_input()
-        extend(opts, {in_io: 'buffer', in_buf: in_buf})
-    endif
-
-    # http//github.com/vim/vim/issues/4688
-    try
-        job_id = job_start([&shell, &shellcmdflag, cmd], opts)
-    catch /^Vim\%((\a\+)\)\=:E631:/
-    endtry
-enddef
-
-def Jq_stop(arg: string = 'term')
-    if job_status(job_id) == 'run'
-        job_stop(job_id, arg)
-    endif
-enddef
-
-def Jq_close(bang: bool)
-    if !is_running && !(exists('#jqplay#BufDelete') || exists('#jqplay#BufWipeout'))
-        return
-    endif
-
-    Jq_stop()
-    autocmd_delete([{group: 'jqplay'}])
-
-    if bang
-        execute 'bwipeout' filter_buf
-        execute 'bwipeout' out_buf
-        if Jq_with_input() && getbufvar(in_buf, '&buftype') == 'nofile'
-            execute 'bwipeout' in_buf
+    if a:bang
+        execute 'bdelete' s:jq_ctx.filter_buf
+        execute 'bdelete' s:jq_ctx.out_buf
+        if s:jq_ctx.in_buf != -1 && getbufvar(s:jq_ctx.in_buf, '&buftype') ==# 'nofile'
+            execute 'bdelete' s:jq_ctx.in_buf
         endif
     endif
 
     delcommand JqplayClose
     delcommand Jqrun
     delcommand Jqstop
-    is_running = false
-    Warning('interactive session closed')
-enddef
+    let s:jqplay_open = 0
+    echohl WarningMsg | echomsg 'jqplay session closed' | echohl None
+endfunction
 
-# When 'in_buffer' is set to -1, no input buffer is passed to jq
-export def Start(mods: string, args: string, in_buffer: number)
-    if args =~ '\%(^\|\s\)-\a*f\>\|--from-file\>'
-        Error('-f and --from-file options not allowed')
-        return
+function! s:run_manually(bang, args) abort
+    if a:args =~# '-\a*f\>\|--from-file\>'
+        return s:error('jqplay: -f and --from-file options not allowed')
     endif
 
-    if is_running
-        Error('only one interactive session allowed')
-        return
+    let in_buf = s:jq_ctx.in_buf
+    let filter_buf = s:jq_ctx.filter_buf
+    let filter_tick = getbufvar(filter_buf, 'jq_changedtick')
+
+    if filter_tick != getbufvar(filter_buf, 'changedtick')
+        call writefile(getbufline(filter_buf, 1, '$'), s:jq_ctx.filter_file)
     endif
 
-    is_running = true
-    in_buf = in_buffer
-
-    # Check if -r/--raw-output or -j/--join-output options are passed
-    const out_ft: string = args =~ '\%(^\|\s\)-\a*[rj]\a*\|--\%(raw\|join\)-output\>' ? '' : 'json'
-
-    # Output buffer
-    const out_name: string = 'jq-output://' .. (in_buffer == -1 ? '' : bufname(in_buffer))
-    out_buf = New_scratch(out_name, out_ft, true, mods)
-
-    # jq filter buffer
-    const filter_name: string = 'jq-filter://' .. (in_buffer == -1 ? '' : bufname(in_buffer))
-    filter_buf = New_scratch(filter_name, 'jq', false, 'botright', {resize: 10})
-
-    # Temporary file where jq filter buffer is written to
-    filter_file = tempname()
-
-    in_changedtick = getbufvar(in_buffer, 'changedtick', -1)
-    filter_changedtick = getbufvar(filter_buf, 'changedtick')
-    in_timer = 0
-    filter_timer = 0
-    jq_cmd = Jqcmd(Getopt('exe'), Getopt('opts'), args, filter_file)
-
-    command -bar -bang JqplayClose Jq_close(<bang>false)
-    command -bar -bang -nargs=? -complete=customlist,Complete Jqrun Run_manually(<bang>false, <q-args>)
-    command -nargs=? -complete=custom,Stopcomplete Jqstop Jq_stop(<q-args>)
-
-    # When input, output or filter buffer are deleted/wiped out, close the
-    # interactive session
-    autocmd_add([
-        {
-            group: 'jqplay',
-            event: ['BufDelete', 'BufWipeout'],
-            bufnr: out_buf,
-            cmd: 'Jq_close(false)'
-        },
-        {
-            group: 'jqplay',
-            event: ['BufDelete', 'BufWipeout'],
-            bufnr: filter_buf,
-            cmd: 'Jq_close(false)'
-        }
-    ])
-
-    if Jq_with_input()
-        autocmd_add([{
-            group: 'jqplay',
-            event: ['BufDelete', 'BufWipeout'],
-            bufnr: in_buffer,
-            cmd: 'Jq_close(false)'
-        }])
+    let jq_ctx = copy(s:jq_ctx)
+    let jq_ctx.cmd = s:jqcmd(s:get('exe'), s:get('opts'), a:args, s:jq_ctx.filter_file)
+    if a:bang
+        let s:jq_ctx = jq_ctx
     endif
-
-    # Run jq interactively when input or filter buffer are modified
-    const events: list<string> = Getopt('autocmds')
-
-    if empty(events)
-        return
-    endif
-
-    autocmd_add([{
-        group: 'jqplay',
-        event: events,
-        bufnr: filter_buf,
-        cmd: 'On_filter_changed()'
-    }])
-
-    if Jq_with_input()
-        autocmd_add([{
-            group: 'jqplay',
-            event: events,
-            bufnr: bufnr(),
-            cmd: 'On_input_changed()'
-        }])
-    endif
-enddef
-
-export def Scratch(input: bool, mods: string, args: string)
-    if is_running
-        Error('only one interactive session allowed')
-        return
-    endif
-
-    if args =~ '\%(^\|\s\)-\a*f\>\|--from-file\>'
-        Error('-f and --from-file options not allowed')
-        return
-    endif
-
-    const raw_input: bool = args =~ '\%(^\|\s\)-\a*R\a*\>\|--raw-input\>'
-    const null_input: bool = args =~ '\%(^\|\s\)-\a*n\a*\>\|--null-input\>'
-
-    if !input && raw_input && null_input
-        Error('not possible to run :JqplayScratchNoInput with -n and -R')
-        return
-    endif
-
-    if input
-        tabnew
-        setlocal buflisted buftype=nofile bufhidden=hide noswapfile
-        if !raw_input
-            setlocal filetype=json
-        endif
+    if in_buf == -1
+        call s:jq_job(s:jq_ctx, function('s:close_cb', [filter_buf]))
     else
-        tab split
+        call s:jq_job(jq_ctx, function('s:close_cb_2', [in_buf, filter_buf]))
+    endif
+endfunction
+
+function! s:filter_changed() abort
+    let filter_buf = s:jq_ctx.filter_buf
+    if getbufvar(filter_buf, 'jq_changedtick') == getbufvar(filter_buf, 'changedtick')
+        return
+    endif
+    call writefile(getbufline(filter_buf, 1, '$'), s:jq_ctx.filter_file)
+    call s:jq_job(s:jq_ctx, function('s:close_cb', [filter_buf]))
+endfunction
+
+function! s:input_changed() abort
+    let in_buf = s:jq_ctx.in_buf
+    if getbufvar(in_buf, 'jq_changedtick') == getbufvar(in_buf, 'changedtick')
+        return
+    endif
+    call s:jq_job(s:jq_ctx, function('s:close_cb', [in_buf]))
+endfunction
+
+function! s:close_cb(buf, channel) abort
+    silent call deletebufline(s:jq_ctx.out_buf, 1)
+    call setbufvar(a:buf, 'jq_changedtick', getbufvar(a:buf, 'changedtick'))
+endfunction
+
+function! s:close_cb_2(buf1, buf2, channel) abort
+    silent call deletebufline(s:jq_ctx.out_buf, 1)
+    call setbufvar(a:buf1, 'jq_changedtick', getbufvar(a:buf1, 'changedtick'))
+    call setbufvar(a:buf2, 'jq_changedtick', getbufvar(a:buf2, 'changedtick'))
+endfunction
+
+function! s:jq_job(jq_ctx, close_cb) abort
+    silent call deletebufline(a:jq_ctx.out_buf, 1, '$')
+
+    if exists('s:job') && job_status(s:job) ==# 'run'
+        call job_stop(s:job)
     endif
 
-    const arg: string = !input && !null_input ? (args .. ' -n') : args
-    const bufnr: number = input ? bufnr() : -1
-    Start(mods, arg, bufnr)
+    let opts = {
+            \ 'in_io': 'null',
+            \ 'out_cb': {_,msg -> appendbufline(a:jq_ctx.out_buf, '$', msg)},
+            \ 'err_cb': {_,msg -> appendbufline(a:jq_ctx.out_buf, '$', '// ' . msg)},
+            \ 'close_cb': a:close_cb
+            \ }
 
-    # Close the initial window that we opened with :tab split
-    if !input
-        close
+    if a:jq_ctx.in_buf != -1
+        call extend(opts, {'in_io': 'buffer', 'in_buf': a:jq_ctx.in_buf})
     endif
-enddef
 
-export def Job(): job
-    return job_id
-enddef
+    " https://github.com/vim/vim/issues/4688
+    try
+        let s:job = job_start([&shell, &shellcmdflag, a:jq_ctx.cmd], opts)
+    catch /^Vim\%((\a\+)\)\=:E631:/
+    endtry
+endfunction
 
-export def Stopcomplete(_, _, _): string
+function! jqplay#stop(...) abort
+    return exists('s:job') ? job_stop(s:job, a:0 ? a:1 : 'term') : ''
+endfunction
+
+function! jqplay#jq_job() abort
+    return exists('s:job') ? s:job : ''
+endfunction
+
+function! jqplay#stophow(arglead, cmdline, cursorpos) abort
     return join(['term', 'hup', 'quit', 'int', 'kill'], "\n")
-enddef
+endfunction
 
-export def Complete(arglead: string, _, _): list<string>
-    if arglead[0] == '-'
-        return copy([
-            '-a', '-C', '-c', '-e', '-f', '-h', '-j', '-L', '-M',
-            '-n', '-R', '-r', '-S', '-s', '--arg', '--argfile', '--argjson',
-            '--args', '--ascii-output', '--exit-status', '--from-file',
-            '--color-output', '--compact-output', '--help', '--indent',
-            '--join-output', '--jsonargs', '--monochrome-output',
-            '--null-input', '--raw-input', '--raw-output', '--rawfile',
-            '--run-tests', '--seq', '--slurp', '--slurpfile', '--sort-keys',
-            '--stream', '--tab', '--unbuffered'
-        ])
-        ->filter((_, i: string): bool => stridx(i, arglead) == 0)
+function! jqplay#complete(arglead, cmdline, cursorpos) abort
+    if a:arglead[0] ==# '-'
+        return filter(
+                \ copy(['-a', '-C', '-c', '-e', '-f', '-h', '-j', '-L', '-M',
+                \ '-n', '-R', '-r', '-S', '-s', '--arg', '--argfile', '--argjson',
+                \ '--args', '--ascii-output', '--exit-status', '--from-file',
+                \ '--color-output', '--compact-output', '--help', '--indent',
+                \ '--join-output', '--jsonargs', '--monochrome-output',
+                \ '--null-input', '--raw-input', '--raw-output', '--rawfile',
+                \ '--run-tests', '--seq', '--slurp', '--slurpfile', '--sort-keys',
+                \ '--stream', '--tab', '--unbuffered']),
+                \ 'stridx(v:val, a:arglead) == 0')
+    else
+        return map(getcompletion(a:arglead, 'file'), 'fnameescape(v:val)')
     endif
+endfunction
 
-    return arglead
-        ->getcompletion('file')
-        ->map((_, i: string): string => fnameescape(i))
-enddef
+let &cpoptions = s:save_cpo
+unlet s:save_cpo
